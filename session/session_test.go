@@ -25,11 +25,16 @@ type fakeWorkerPoolClient struct {
 
 	// configuration for behavior
 	keepAliveErrOnce error // if set, first KeepAlive returns this error
+	returnErr        error // if set, every ReturnWorker fails with it
 
-	// if set, ReturnWorker calls it matches wait until releaseHeld is closed or their context ends
-	holdReturn  func(*pbworker.ReturnWorkerRequest) bool
-	releaseHeld chan struct{}
-	held        int // ReturnWorker calls currently waiting
+	// Gates hold the calls they apply to until closed, or until the call's context ends.
+	borrowGate    chan struct{}
+	keepAliveGate chan struct{}
+	returnGate    chan struct{}
+	gateReturn    func(*pbworker.ReturnWorkerRequest) bool // which returns returnGate holds, all if nil
+
+	// calls currently held at a gate, by method
+	held map[string]int
 
 	// recordings
 	borrowRequests []*pbworker.BorrowWorkerRequest
@@ -38,10 +43,71 @@ type fakeWorkerPoolClient struct {
 }
 
 func newFakeWorkerPoolClient() *fakeWorkerPoolClient {
-	return &fakeWorkerPoolClient{nextSessionID: 1, nextWorkerID: 1}
+	return &fakeWorkerPoolClient{nextSessionID: 1, nextWorkerID: 1, held: make(map[string]int)}
+}
+
+func (f *fakeWorkerPoolClient) pass(ctx context.Context, method string, gate chan struct{}) error {
+	if gate == nil {
+		return nil
+	}
+
+	f.mu.Lock()
+	f.held[method]++
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.held[method]--
+		f.mu.Unlock()
+	}()
+
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *fakeWorkerPoolClient) waitHeld(t *testing.T, method string, n int) {
+	t.Helper()
+
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
+		f.mu.Lock()
+		held := f.held[method]
+		f.mu.Unlock()
+		if held == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d held %s calls, have %d", n, method, held)
+		}
+	}
+}
+
+// returnedLifetimes maps each returned key to the minimal lifetime of every return received for it.
+func (f *fakeWorkerPoolClient) returnedLifetimes() map[string][]time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	lifetimes := make(map[string][]time.Duration)
+	for _, r := range f.returned {
+		lifetimes[r.WorkerKey] = append(lifetimes[r.WorkerKey], r.GetMinimalWorkerLifeDuration().AsDuration())
+	}
+	return lifetimes
+}
+
+func (f *fakeWorkerPoolClient) counts() (borrows, keepAlives, returns int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.borrowRequests), len(f.keepAlives), len(f.returned)
 }
 
 func (f *fakeWorkerPoolClient) BorrowWorker(ctx context.Context, in *pbworker.BorrowWorkerRequest, _ ...grpc.CallOption) (*pbworker.BorrowWorkerResponse, error) {
+	if err := f.pass(ctx, "BorrowWorker", f.borrowGate); err != nil {
+		return nil, err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.borrowRequests = append(f.borrowRequests, in)
@@ -67,6 +133,10 @@ func (f *fakeWorkerPoolClient) BorrowWorker(ctx context.Context, in *pbworker.Bo
 
 // KeepAlive simulates a keep alive, optionally failing once with configured error
 func (f *fakeWorkerPoolClient) KeepAlive(ctx context.Context, in *pbworker.KeepAliveRequest, _ ...grpc.CallOption) (*pbworker.KeepAliveResponse, error) {
+	if err := f.pass(ctx, "KeepAlive", f.keepAliveGate); err != nil {
+		return nil, err
+	}
+
 	f.mu.Lock()
 	f.keepAlives = append(f.keepAlives, in)
 	var err error
@@ -82,59 +152,19 @@ func (f *fakeWorkerPoolClient) KeepAlive(ctx context.Context, in *pbworker.KeepA
 }
 
 func (f *fakeWorkerPoolClient) ReturnWorker(ctx context.Context, in *pbworker.ReturnWorkerRequest, _ ...grpc.CallOption) (*pbworker.ReturnWorkerResponse, error) {
-	f.mu.Lock()
-	hold := f.holdReturn != nil && f.holdReturn(in)
-	if hold {
-		f.held++
-	}
-	f.mu.Unlock()
-
-	if hold {
-		defer func() {
-			f.mu.Lock()
-			f.held--
-			f.mu.Unlock()
-		}()
-
-		select {
-		case <-f.releaseHeld:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	if f.gateReturn == nil || f.gateReturn(in) {
+		if err := f.pass(ctx, "ReturnWorker", f.returnGate); err != nil {
+			return nil, err
 		}
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.returnErr != nil {
+		return nil, f.returnErr
+	}
 	f.returned = append(f.returned, in)
 	return &pbworker.ReturnWorkerResponse{}, nil
-}
-
-// returnedLifetimes maps each returned key to the minimal lifetime of every return received for it.
-func (f *fakeWorkerPoolClient) returnedLifetimes() map[string][]time.Duration {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	lifetimes := make(map[string][]time.Duration)
-	for _, r := range f.returned {
-		lifetimes[r.WorkerKey] = append(lifetimes[r.WorkerKey], r.GetMinimalWorkerLifeDuration().AsDuration())
-	}
-	return lifetimes
-}
-
-func (f *fakeWorkerPoolClient) waitHeld(t *testing.T, n int) {
-	t.Helper()
-
-	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
-		f.mu.Lock()
-		held := f.held
-		f.mu.Unlock()
-		if held == n {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected %d held ReturnWorker calls, have %d", n, held)
-		}
-	}
 }
 
 // implement unused interface method to satisfy WorkerPoolClient
@@ -297,12 +327,41 @@ func newTestPool(fake *fakeWorkerPoolClient) *tgmSessionPool {
 	}
 }
 
-// holdSessionReleases holds the session returns sent by Release, recognizable by their non-zero
-// minimal lifetime, so a test can observe the pool while they are in flight.
-func holdSessionReleases(fake *fakeWorkerPoolClient) {
-	fake.releaseHeld = make(chan struct{})
-	fake.holdReturn = func(in *pbworker.ReturnWorkerRequest) bool {
+// gateSessionReleases holds the session returns sent by Release, recognizable by their non-zero
+// minimal lifetime.
+func gateSessionReleases(fake *fakeWorkerPoolClient) {
+	fake.returnGate = make(chan struct{})
+	fake.gateReturn = func(in *pbworker.ReturnWorkerRequest) bool {
 		return in.GetMinimalWorkerLifeDuration().AsDuration() > 0
+	}
+}
+
+func closeAsync(pool *tgmSessionPool, ctx context.Context) <-chan error {
+	closed := make(chan error, 1)
+	go func() { closed <- pool.Close(ctx) }()
+	return closed
+}
+
+func requireBlocked(t *testing.T, closed <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while work was still under way", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func requireClosed(t *testing.T, closed <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Close did not return")
 	}
 }
 
@@ -342,13 +401,65 @@ func TestClose_ReturnsTrackedSessionsAndWorkers(t *testing.T) {
 	}
 }
 
-func TestClose_ReturnsSessionWhoseReleaseIsInFlight(t *testing.T) {
+func TestClose_WaitsForReleaseInFlight(t *testing.T) {
 	t.Parallel()
 
 	fake := newFakeWorkerPoolClient()
-	holdSessionReleases(fake)
-	defer close(fake.releaseHeld)
+	gateSessionReleases(fake)
+	pool := newTestPool(fake)
 
+	session, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	pool.Release(session)
+	fake.waitHeld(t, "ReturnWorker", 1)
+
+	closed := closeAsync(pool, context.Background())
+	requireBlocked(t, closed)
+
+	close(fake.returnGate)
+	requireClosed(t, closed)
+
+	if got := fake.returnedLifetimes()[session]; len(got) != 1 || got[0] != 5*time.Second {
+		t.Fatalf("expected the session returned once, by Release, got %v", got)
+	}
+}
+
+func TestClose_WaitsForBorrowInFlight(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
+	fake.borrowGate = make(chan struct{})
+	pool := newTestPool(fake)
+
+	borrowed := make(chan string, 1)
+	go func() {
+		key, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil)
+		if err != nil {
+			t.Errorf("Get failed: %v", err)
+		}
+		borrowed <- key
+	}()
+	fake.waitHeld(t, "BorrowWorker", 1)
+
+	closed := closeAsync(pool, context.Background())
+	requireBlocked(t, closed)
+
+	close(fake.borrowGate)
+	requireClosed(t, closed)
+
+	session := <-borrowed
+	if got := fake.returnedLifetimes()[session]; len(got) != 1 || got[0] != 0 {
+		t.Fatalf("expected the session borrowed during Close returned once by Close, got %v", got)
+	}
+}
+
+func TestClose_RefusesNewBorrows(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
 	pool := newTestPool(fake)
 	ctx := context.Background()
 
@@ -356,20 +467,86 @@ func TestClose_ReturnsSessionWhoseReleaseIsInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
+	if err := pool.Close(ctx); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	borrowsBefore, _, _ := fake.counts()
 
-	// Release has started returning the session but the session server has not been told yet,
-	// which is where an exiting process used to lose it.
-	pool.Release(session)
-	fake.waitHeld(t, 1)
+	if _, err := pool.Get(ctx, "svc", "org", "api", "trace-2", nil); !errors.Is(err, dsession.ErrUnavailable) {
+		t.Fatalf("expected ErrUnavailable from Get after Close, got %v", err)
+	}
+	if _, err := pool.GetWorker(ctx, "svc", session, 5); !errors.Is(err, dsession.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound from GetWorker after Close, got %v", err)
+	}
 
-	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	if err := pool.Close(closeCtx); err != nil {
+	if borrows, _, _ := fake.counts(); borrows != borrowsBefore {
+		t.Fatalf("expected no borrow sent after Close, got %d more", borrows-borrowsBefore)
+	}
+}
+
+func TestClose_LaterCallsWaitForTheFirst(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
+	pool := newTestPool(fake)
+
+	session, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	fake.returnGate = make(chan struct{})
+	first := closeAsync(pool, context.Background())
+	fake.waitHeld(t, "ReturnWorker", 1)
+
+	second := closeAsync(pool, context.Background())
+	requireBlocked(t, second)
+
+	close(fake.returnGate)
+	requireClosed(t, first)
+	requireClosed(t, second)
+
+	if got := fake.returnedLifetimes()[session]; len(got) != 1 {
+		t.Fatalf("expected the session returned once across Close calls, got %v", got)
+	}
+}
+
+func TestClose_StopsKeepAlive(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
+	pool := newTestPool(fake)
+	pool.config.RequestKeepAliveDelay = 5 * time.Millisecond
+
+	if _, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil); err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if err := pool.Close(context.Background()); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	if got := fake.returnedLifetimes()[session]; len(got) != 1 || got[0] != 0 {
-		t.Fatalf("expected Close to return the session with no minimal lifetime, got %v", got)
+	// Allow a keep-alive that was already running when Close returned to finish.
+	time.Sleep(10 * time.Millisecond)
+	_, before, _ := fake.counts()
+	time.Sleep(50 * time.Millisecond)
+	if _, after, _ := fake.counts(); after != before {
+		t.Fatalf("expected no keep-alive after Close, got %d more", after-before)
+	}
+}
+
+func TestClose_ReportsFailedReturns(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
+	fake.returnErr = status.Error(codes.Unavailable, "down")
+	pool := newTestPool(fake)
+
+	if _, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil); err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if err := pool.Close(context.Background()); err == nil {
+		t.Fatalf("expected Close to report the failed return")
 	}
 }
 
@@ -377,14 +554,16 @@ func TestClose_GivesUpAtContextDeadline(t *testing.T) {
 	t.Parallel()
 
 	fake := newFakeWorkerPoolClient()
-	fake.releaseHeld = make(chan struct{})
-	defer close(fake.releaseHeld)
-	fake.holdReturn = func(*pbworker.ReturnWorkerRequest) bool { return true }
-
+	gateSessionReleases(fake)
+	defer close(fake.returnGate)
 	pool := newTestPool(fake)
-	if _, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil); err != nil {
+
+	session, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil)
+	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
+	pool.Release(session)
+	fake.waitHeld(t, "ReturnWorker", 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -394,13 +573,39 @@ func TestClose_GivesUpAtContextDeadline(t *testing.T) {
 	}
 }
 
-func TestGetWorker_RefusesSessionBeingReleased(t *testing.T) {
+func TestRelease_WaitsForKeepAliveInFlight(t *testing.T) {
 	t.Parallel()
 
 	fake := newFakeWorkerPoolClient()
-	holdSessionReleases(fake)
-	defer close(fake.releaseHeld)
+	fake.keepAliveGate = make(chan struct{})
+	pool := newTestPool(fake)
+	pool.config.RequestKeepAliveDelay = 5 * time.Millisecond
 
+	session, err := pool.Get(context.Background(), "svc", "org", "api", "trace", nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	fake.waitHeld(t, "KeepAlive", 1)
+
+	pool.Release(session)
+	time.Sleep(50 * time.Millisecond)
+	if _, _, returns := fake.counts(); returns != 0 {
+		t.Fatalf("expected the return to wait for the keep-alive in flight")
+	}
+
+	close(fake.keepAliveGate)
+	if err := pool.Close(context.Background()); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if got := fake.returnedLifetimes()[session]; len(got) != 1 {
+		t.Fatalf("expected the session returned once, got %v", got)
+	}
+}
+
+func TestReleaseWorker_SkipsWorkerReturnedWithItsSession(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
 	pool := newTestPool(fake)
 	ctx := context.Background()
 
@@ -408,9 +613,37 @@ func TestGetWorker_RefusesSessionBeingReleased(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
+	worker, err := pool.GetWorker(ctx, "svc", session, 5)
+	if err != nil {
+		t.Fatalf("GetWorker failed: %v", err)
+	}
 
 	pool.Release(session)
-	fake.waitHeld(t, 1)
+	pool.ReleaseWorker(worker)
+	if err := pool.Close(ctx); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if got := fake.returnedLifetimes()[worker]; len(got) != 1 {
+		t.Fatalf("expected the worker returned once, got %v", got)
+	}
+}
+
+func TestGetWorker_RefusesReleasedSession(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeWorkerPoolClient()
+	gateSessionReleases(fake)
+	defer close(fake.returnGate)
+	pool := newTestPool(fake)
+	ctx := context.Background()
+
+	session, err := pool.Get(ctx, "svc", "org", "api", "trace", nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	pool.Release(session)
+	fake.waitHeld(t, "ReturnWorker", 1)
 
 	if _, err := pool.GetWorker(ctx, "svc", session, 5); !errors.Is(err, dsession.ErrSessionNotFound) {
 		t.Fatalf("expected ErrSessionNotFound for a released session, got %v", err)

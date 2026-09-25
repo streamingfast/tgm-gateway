@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -39,23 +40,23 @@ type sessionInfo struct {
 	traceID        string
 	workers        map[string]struct{} // Track worker keys for this session
 	closer         chan struct{}       // Channel to signal session closure
-	mutex          sync.Mutex
 
-	// released is set by Release, which keeps the session tracked until its return has been
-	// sent, so Close still finds it. Guarded by the pool's sessionsMutex.
-	released bool
+	// mutex is held by the keep-alive for the whole of its calls, so a return can wait for a
+	// keep-alive in flight. The workers map is guarded by the pool's sessionsMutex instead.
+	mutex sync.Mutex
 }
 
+// workerKeys must be called with the pool's sessionsMutex held.
 func (s *sessionInfo) workerKeys() []string {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	workerKeys := make([]string, 0, len(s.workers))
 	for workerKey := range s.workers {
 		workerKeys = append(workerKeys, workerKey)
 	}
 	return workerKeys
 }
+
+// returnTimeout bounds each return sent in the background.
+const returnTimeout = 10 * time.Second
 
 type tgmSessionPool struct {
 	config                 *Config
@@ -64,6 +65,14 @@ type tgmSessionPool struct {
 	conn                   *grpc.ClientConn
 	sessions               map[string]*sessionInfo // Map sessionKey -> session info
 	sessionsMutex          sync.Mutex
+
+	// inFlight counts the borrows and returns under way, which Close waits for before returning
+	// what is left. It is only added to under sessionsMutex while closed is false.
+	inFlight sync.WaitGroup
+	closed   bool // guarded by sessionsMutex
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newTGMSessionPool(config *Config, logger *zap.Logger) (dsession.SessionPool, error) {
@@ -106,6 +115,11 @@ func newTGMSessionPool(config *Config, logger *zap.Logger) (dsession.SessionPool
 }
 
 func (t *tgmSessionPool) Get(ctx context.Context, serviceName string, organizationID string, apiKeyID string, traceID string, onError func(error)) (string, error) {
+	if !t.track() {
+		return "", fmt.Errorf("%w: session pool is closed", dsession.ErrUnavailable)
+	}
+	defer t.inFlight.Done()
+
 	resp, err := t.remoteWorkerPoolClient.BorrowWorker(ctx,
 		&pbworker.BorrowWorkerRequest{
 			Service:        serviceName,
@@ -168,61 +182,141 @@ func (t *tgmSessionPool) Get(ctx context.Context, serviceName string, organizati
 }
 
 func (t *tgmSessionPool) Release(sessionKey string) {
+	if !t.track() {
+		// Close returns every session still tracked.
+		return
+	}
+
 	go func() {
+		defer t.inFlight.Done()
+
 		t.sessionsMutex.Lock()
 		sessionInfo := t.sessions[sessionKey]
-		if sessionInfo == nil || sessionInfo.released {
+		if sessionInfo == nil {
 			t.sessionsMutex.Unlock()
 			return
 		}
-		sessionInfo.released = true
-		workersToRelease := sessionInfo.workerKeys()
+		delete(t.sessions, sessionKey)
+		workerKeys := sessionInfo.workerKeys()
 		t.sessionsMutex.Unlock()
 
 		close(sessionInfo.closer)
 
-		t.returnSession(context.Background(), sessionKey, workersToRelease, &durationpb.Duration{Seconds: int64(t.config.MinimalWorkerLifeDuration.Seconds())})
+		// A keep-alive landing after the return would push a session still inside its minimal
+		// lifetime back up to the full keep-alive TTL on the session server.
+		sessionInfo.mutex.Lock()
+		sessionInfo.mutex.Unlock()
 
-		// Forgotten only once the session server has been told: until then, Close must still find
-		// the session in case the process exits before this return is sent.
-		t.sessionsMutex.Lock()
-		delete(t.sessions, sessionKey)
-		t.sessionsMutex.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), returnTimeout)
+		defer cancel()
+
+		if err := t.returnSession(ctx, sessionKey, workerKeys, &durationpb.Duration{Seconds: int64(t.config.MinimalWorkerLifeDuration.Seconds())}); err != nil {
+			t.logger.Warn("failed to return session", zap.String("session_key", sessionKey), zap.Error(err))
+		}
 	}()
 }
 
 // Close returns every session the pool still tracks, with its workers, to the session server.
-// Call it right before the process exits. Release sends its return in the background, so a
-// session whose return had not been sent when the process exited would stay counted against the
-// organization until it expired on the session server. A session whose Release is in flight is
-// returned twice; a second return for a key already gone changes nothing on the session server.
+// Call it right before the process exits, once requests have ended: returns are otherwise sent
+// in the background, and one the process exits before sending leaves its session counted against
+// the organization until it expires on the session server. Close first waits for the borrows and
+// returns under way, and the pool refuses new sessions and workers from then on. Only the first
+// call does the work; later calls return its result.
 func (t *tgmSessionPool) Close(ctx context.Context) error {
+	t.closeOnce.Do(func() {
+		t.closeErr = t.close(ctx)
+	})
+
+	return t.closeErr
+}
+
+func (t *tgmSessionPool) close(ctx context.Context) error {
 	t.sessionsMutex.Lock()
-	toReturn := make(map[string][]string, len(t.sessions))
-	for sessionKey, sessionInfo := range t.sessions {
-		toReturn[sessionKey] = sessionInfo.workerKeys()
+	t.closed = true
+	t.sessionsMutex.Unlock()
+
+	if err := waitOrDone(ctx, &t.inFlight); err != nil {
+		return fmt.Errorf("waiting for borrows and returns under way: %w", err)
+	}
+
+	t.sessionsMutex.Lock()
+	sessions := t.sessions
+	t.sessions = make(map[string]*sessionInfo)
+	workerKeys := make(map[string][]string, len(sessions))
+	for sessionKey, sessionInfo := range sessions {
+		workerKeys[sessionKey] = sessionInfo.workerKeys()
 	}
 	t.sessionsMutex.Unlock()
 
 	// These requests end because this process is going away, not because the client left, so the
-	// minimal lifetime that stops clients from cycling sessions does not apply.
+	// minimal lifetime that stops clients from cycling sessions does not apply. The session server
+	// deletes the key outright, so a keep-alive still in flight cannot extend it afterwards.
+	noMinimalLifetime := durationpb.New(0)
+
 	var wg sync.WaitGroup
-	for sessionKey, workerKeys := range toReturn {
+	errs := make([]error, 0, len(sessions))
+	var errsLock sync.Mutex
+	for sessionKey, sessionInfo := range sessions {
+		close(sessionInfo.closer)
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			t.returnSession(ctx, sessionKey, workerKeys, durationpb.New(0))
+			if err := t.returnSession(ctx, sessionKey, workerKeys[sessionKey], noMinimalLifetime); err != nil {
+				errsLock.Lock()
+				errs = append(errs, err)
+				errsLock.Unlock()
+			}
 		}()
 	}
 	wg.Wait()
 
-	return ctx.Err()
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("returning %d sessions on close: %w", len(sessions), err)
+	}
+
+	t.logger.Info("returned sessions on close", zap.Int("session_count", len(sessions)))
+	return nil
 }
 
-func (t *tgmSessionPool) returnSession(ctx context.Context, sessionKey string, workerKeys []string, minimalLifetime *durationpb.Duration) {
+// track registers a borrow or return under way so Close waits for it. It reports false once Close
+// has started: nothing may be borrowed anymore, and Close returns what is still tracked itself.
+func (t *tgmSessionPool) track() bool {
+	t.sessionsMutex.Lock()
+	defer t.sessionsMutex.Unlock()
+
+	if t.closed {
+		return false
+	}
+	t.inFlight.Add(1)
+
+	return true
+}
+
+// waitOrDone waits for wg unless ctx ends first. The waiting goroutine then lingers until the
+// operations under way end, each bounded by returnTimeout or by its request.
+func waitOrDone(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *tgmSessionPool) returnSession(ctx context.Context, sessionKey string, workerKeys []string, minimalLifetime *durationpb.Duration) error {
+	errs := make([]error, 0, len(workerKeys)+1)
 	for _, workerKey := range workerKeys {
-		t.releaseWorkerInternal(ctx, workerKey)
+		if err := t.returnWorker(ctx, workerKey); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	resp, err := t.remoteWorkerPoolClient.ReturnWorker(ctx,
@@ -232,15 +326,25 @@ func (t *tgmSessionPool) returnSession(ctx context.Context, sessionKey string, w
 		},
 		grpc.WaitForReady(false),
 	)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("returning session %s: %w", sessionKey, err))
+	} else {
+		t.logger.Debug("returned request worker", zap.String("key", sessionKey), zap.Stringer("status", resp.GetStatus()))
+	}
 
-	t.logger.Debug("returned request worker", zap.String("key", sessionKey), zap.Stringer("status", resp.GetStatus()), zap.Error(err))
+	return errors.Join(errs...)
 }
 
 func (t *tgmSessionPool) GetWorker(ctx context.Context, serviceName string, sessionKey string, maxWorkersPerSession int) (string, error) {
+	if !t.track() {
+		return "", fmt.Errorf("%w: session pool is closed", dsession.ErrSessionNotFound)
+	}
+	defer t.inFlight.Done()
+
 	// Look up session info
 	t.sessionsMutex.Lock()
 	sessionInfo := t.sessions[sessionKey]
-	if sessionInfo == nil || sessionInfo.released {
+	if sessionInfo == nil {
 		t.sessionsMutex.Unlock()
 		return "", fmt.Errorf("%w: session key %s not found", dsession.ErrSessionNotFound, sessionKey)
 	}
@@ -290,10 +394,14 @@ func (t *tgmSessionPool) GetWorker(ctx context.Context, serviceName string, sess
 	// Track this worker under the session
 	t.sessionsMutex.Lock()
 	sessionInfo = t.sessions[sessionKey]
-	if sessionInfo == nil || sessionInfo.released {
+	if sessionInfo == nil {
 		t.sessionsMutex.Unlock()
 		// Session was released, immediately release the newly acquired worker
-		go t.releaseWorkerInternal(context.Background(), workerKey)
+		returnCtx, cancel := context.WithTimeout(context.Background(), returnTimeout)
+		defer cancel()
+		if err := t.returnWorker(returnCtx, workerKey); err != nil {
+			t.logger.Warn("failed to return worker of a released session", zap.String("worker_key", workerKey), zap.Error(err))
+		}
 		return "", fmt.Errorf("%w: session key %s was released", dsession.ErrSessionNotFound, sessionKey)
 	}
 	sessionInfo.workers[workerKey] = struct{}{}
@@ -305,26 +413,53 @@ func (t *tgmSessionPool) GetWorker(ctx context.Context, serviceName string, sess
 }
 
 func (t *tgmSessionPool) ReleaseWorker(workerKey string) {
-	// Remove worker from session tracking
-	t.sessionsMutex.Lock()
-	defer t.sessionsMutex.Unlock()
-	for _, sessionInfo := range t.sessions {
-		delete(sessionInfo.workers, workerKey)
+	if !t.track() {
+		// Close returns every worker still tracked.
+		return
 	}
 
-	// Release worker in a goroutine (fire-and-forget)
-	go t.releaseWorkerInternal(context.Background(), workerKey)
+	t.sessionsMutex.Lock()
+	tracked := false
+	for _, sessionInfo := range t.sessions {
+		if _, found := sessionInfo.workers[workerKey]; found {
+			delete(sessionInfo.workers, workerKey)
+			tracked = true
+		}
+	}
+	t.sessionsMutex.Unlock()
+
+	if !tracked {
+		// Every worker handed out is tracked under its session until returned, so this one was
+		// already returned with its session.
+		t.inFlight.Done()
+		return
+	}
+
+	go func() {
+		defer t.inFlight.Done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), returnTimeout)
+		defer cancel()
+
+		if err := t.returnWorker(ctx, workerKey); err != nil {
+			t.logger.Warn("failed to return worker", zap.String("worker_key", workerKey), zap.Error(err))
+		}
+	}()
 }
 
-func (t *tgmSessionPool) releaseWorkerInternal(ctx context.Context, workerKey string) {
+func (t *tgmSessionPool) returnWorker(ctx context.Context, workerKey string) error {
 	resp, err := t.remoteWorkerPoolClient.ReturnWorker(ctx,
 		&pbworker.ReturnWorkerRequest{
 			WorkerKey: workerKey,
 		},
 		grpc.WaitForReady(false),
 	)
+	if err != nil {
+		return fmt.Errorf("returning worker %s: %w", workerKey, err)
+	}
 
-	t.logger.Debug("returned worker", zap.String("key", workerKey), zap.Stringer("status", resp.GetStatus()), zap.Error(err))
+	t.logger.Debug("returned worker", zap.String("key", workerKey), zap.Stringer("status", resp.GetStatus()))
+	return nil
 }
 
 // createApiKeyInterceptor creates a gRPC unary interceptor that adds the X-Api-Key header
