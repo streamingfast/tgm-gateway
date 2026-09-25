@@ -13,6 +13,7 @@ This package implements a session pool that manages worker connections through g
 - **Resource Management**: Handles session borrowing and returning with proper cleanup
 - **Configuration**: Flexible configuration through URL-based config strings
 - **Quota Management**: Quota exhaustion detection that triggers a onError() callback
+- **Shutdown**: `Close(ctx)` returns every session still held and waits for returns in flight. Call it right before the process exits, or sessions of requests cut by the shutdown stay counted against the organization until they expire on the session server
 
 ## Example
 
