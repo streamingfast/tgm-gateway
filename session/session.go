@@ -67,9 +67,8 @@ type tgmSessionPool struct {
 	sessionsMutex          sync.Mutex
 
 	// inFlight counts the borrows and returns under way, which Close waits for before returning
-	// what is left. It is only added to under sessionsMutex while closed is false.
-	inFlight sync.WaitGroup
-	closed   bool // guarded by sessionsMutex
+	// what is left. Once closed, nothing may be borrowed and Close returns what is still tracked.
+	inFlight closableWaitGroup
 
 	closeOnce sync.Once
 	closeErr  error
@@ -115,7 +114,7 @@ func newTGMSessionPool(config *Config, logger *zap.Logger) (dsession.SessionPool
 }
 
 func (t *tgmSessionPool) Get(ctx context.Context, serviceName string, organizationID string, apiKeyID string, traceID string, onError func(error)) (string, error) {
-	if !t.track() {
+	if !t.inFlight.TryAdd() {
 		return "", fmt.Errorf("%w: session pool is closed", dsession.ErrUnavailable)
 	}
 	defer t.inFlight.Done()
@@ -182,7 +181,7 @@ func (t *tgmSessionPool) Get(ctx context.Context, serviceName string, organizati
 }
 
 func (t *tgmSessionPool) Release(sessionKey string) {
-	if !t.track() {
+	if !t.inFlight.TryAdd() {
 		// Close returns every session still tracked.
 		return
 	}
@@ -231,11 +230,7 @@ func (t *tgmSessionPool) Close(ctx context.Context) error {
 }
 
 func (t *tgmSessionPool) close(ctx context.Context) error {
-	t.sessionsMutex.Lock()
-	t.closed = true
-	t.sessionsMutex.Unlock()
-
-	if err := waitOrDone(ctx, &t.inFlight); err != nil {
+	if err := t.inFlight.CloseAndWait(ctx); err != nil {
 		return fmt.Errorf("waiting for borrows and returns under way: %w", err)
 	}
 
@@ -280,37 +275,6 @@ func (t *tgmSessionPool) close(ctx context.Context) error {
 	return nil
 }
 
-// track registers a borrow or return under way so Close waits for it. It reports false once Close
-// has started: nothing may be borrowed anymore, and Close returns what is still tracked itself.
-func (t *tgmSessionPool) track() bool {
-	t.sessionsMutex.Lock()
-	defer t.sessionsMutex.Unlock()
-
-	if t.closed {
-		return false
-	}
-	t.inFlight.Add(1)
-
-	return true
-}
-
-// waitOrDone waits for wg unless ctx ends first. The waiting goroutine then lingers until the
-// operations under way end, each bounded by returnTimeout or by its request.
-func waitOrDone(ctx context.Context, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func (t *tgmSessionPool) returnSession(ctx context.Context, sessionKey string, workerKeys []string, minimalLifetime *durationpb.Duration) error {
 	errs := make([]error, 0, len(workerKeys)+1)
 	for _, workerKey := range workerKeys {
@@ -336,7 +300,7 @@ func (t *tgmSessionPool) returnSession(ctx context.Context, sessionKey string, w
 }
 
 func (t *tgmSessionPool) GetWorker(ctx context.Context, serviceName string, sessionKey string, maxWorkersPerSession int) (string, error) {
-	if !t.track() {
+	if !t.inFlight.TryAdd() {
 		return "", fmt.Errorf("%w: session pool is closed", dsession.ErrSessionNotFound)
 	}
 	defer t.inFlight.Done()
@@ -413,7 +377,7 @@ func (t *tgmSessionPool) GetWorker(ctx context.Context, serviceName string, sess
 }
 
 func (t *tgmSessionPool) ReleaseWorker(workerKey string) {
-	if !t.track() {
+	if !t.inFlight.TryAdd() {
 		// Close returns every worker still tracked.
 		return
 	}
