@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +113,10 @@ func (a *authenticator) Authenticate(ctx context.Context, path string, headers m
 	var token jwt.Token
 	var err error
 
+	// Auth info about what the client presented, never about the reissued/issued internal JWT
+	var authMethod string
+	var clientToken jwt.Token
+
 	// Check for JWT in Authorization header
 	if authHeaders, found := lowerHeaders["authorization"]; found && len(authHeaders) > 0 {
 		token, err = a.extractAndParseJWT(authHeaders[0])
@@ -126,6 +131,9 @@ func (a *authenticator) Authenticate(ctx context.Context, path string, headers m
 			}
 			return ctx, status.Errorf(codes.Unauthenticated, "invalid JWT token")
 		}
+
+		authMethod = dauth.AuthMethodJWT
+		clientToken = token
 
 		needsReissue := a.needsReissue(token)
 		a.logger.Debug("authorization from token", zap.Bool("needsReissue", needsReissue), zap.String("ip_address", ipAddress))
@@ -152,6 +160,7 @@ func (a *authenticator) Authenticate(ctx context.Context, path string, headers m
 			a.logger.Info("failed to issue JWT from API key", zap.Error(err), zap.String("ip_address", ipAddress))
 			return ctx, status.Errorf(codes.Unauthenticated, "failed to authenticate with API key: %q", err)
 		}
+		authMethod = dauth.AuthMethodAPIKey
 		a.logger.Debug("authorization from api key", zap.String("ip_address", ipAddress))
 	} else {
 		// Info() here because there won't be any other trace from the handler function
@@ -160,7 +169,7 @@ func (a *authenticator) Authenticate(ctx context.Context, path string, headers m
 	}
 
 	// Extract claims from JWT and add to context
-	ctx = a.addClaimsToContext(ctx, token, ipAddress)
+	ctx = a.addClaimsToContext(ctx, token, ipAddress, authMethod, clientToken)
 
 	return ctx, nil
 }
@@ -313,7 +322,10 @@ func (a *authenticator) needsReissue(token jwt.Token) bool {
 	return uint64(time.Since(issuedAt).Seconds()) > a.config.ReissueJWTAgeSecs
 }
 
-func (a *authenticator) addClaimsToContext(ctx context.Context, token jwt.Token, ipAddress string) context.Context {
+// addClaimsToContext sets the trusted headers from the claims of `token`. `authMethod` is how the client
+// authenticated and `clientToken` the JWT it presented (nil for API key), which can differ from `token`
+// when the JWT was reissued or issued from an API key.
+func (a *authenticator) addClaimsToContext(ctx context.Context, token jwt.Token, ipAddress string, authMethod string, clientToken jwt.Token) context.Context {
 
 	// Create trusted headers map
 	trustedHeaders := make(dauth.TrustedHeaders)
@@ -354,10 +366,57 @@ func (a *authenticator) addClaimsToContext(ctx context.Context, token jwt.Token,
 		trustedHeaders[dauth.HeaderSubstreamsPlanTier] = substreamsPlanTier
 	}
 
+	if authMethod != "" {
+		trustedHeaders[dauth.HeaderAuthMethod] = authMethod
+		AuthCounter.Inc(authMethod, jwtLifetimeBucketOf(authMethod, clientToken))
+	}
+
+	if authMethod == dauth.AuthMethodJWT && clientToken != nil {
+		issuedAt, hasIat := clientToken.IssuedAt()
+		expiresAt, hasExp := clientToken.Expiration()
+		if hasIat {
+			trustedHeaders[dauth.HeaderAuthJWTIssuedAt] = strconv.FormatInt(issuedAt.Unix(), 10)
+		}
+		if hasExp {
+			trustedHeaders[dauth.HeaderAuthJWTExpiresAt] = strconv.FormatInt(expiresAt.Unix(), 10)
+		}
+		trustedHeaders[dauth.HeaderAuthJWTLifetimeBucket] = jwtLifetimeBucket(issuedAt, hasIat, expiresAt, hasExp)
+	}
+
 	a.logger.Debug("added claims", zap.Any("headers", trustedHeaders))
 
 	// Add trusted headers to context
 	return dauth.WithTrustedHeaders(ctx, trustedHeaders)
+}
+
+// jwtLifetimeBucketOf returns the bucket label used for metrics, empty for non-JWT methods.
+func jwtLifetimeBucketOf(authMethod string, clientToken jwt.Token) string {
+	if authMethod != dauth.AuthMethodJWT || clientToken == nil {
+		return "none"
+	}
+
+	issuedAt, hasIat := clientToken.IssuedAt()
+	expiresAt, hasExp := clientToken.Expiration()
+	return jwtLifetimeBucket(issuedAt, hasIat, expiresAt, hasExp)
+}
+
+// jwtLifetimeBucket must stay in sync with the sf-saas authenticator bucket values.
+func jwtLifetimeBucket(issuedAt time.Time, hasIat bool, expiresAt time.Time, hasExp bool) string {
+	if !hasIat || !hasExp {
+		return dauth.AuthJWTLifetimeBucketUnknown
+	}
+
+	lifetime := expiresAt.Sub(issuedAt)
+	switch {
+	case lifetime <= 15*time.Minute:
+		return dauth.AuthJWTLifetimeBucketLE15m
+	case lifetime <= 24*time.Hour:
+		return dauth.AuthJWTLifetimeBucketLE24h
+	case lifetime >= 3650*24*time.Hour:
+		return dauth.AuthJWTLifetimeBucketGTE10y
+	default:
+		return dauth.AuthJWTLifetimeBucketGT24h
+	}
 }
 
 func jwtFeatureConfigKeyToHeader(featureConfigKey string) string {
