@@ -543,7 +543,7 @@ func TestAuthenticator_addClaimsToContext(t *testing.T) {
 			}
 
 			ctx := context.Background()
-			newCtx := auth.addClaimsToContext(ctx, token, tt.ipAddress)
+			newCtx := auth.addClaimsToContext(ctx, token, tt.ipAddress, "", nil)
 
 			headers := dauth.FromContext(newCtx)
 
