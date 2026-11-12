@@ -389,7 +389,10 @@ func (a *authenticator) addClaimsToContext(ctx context.Context, token jwt.Token,
 	return dauth.WithTrustedHeaders(ctx, trustedHeaders)
 }
 
-// jwtLifetimeBucketOf returns the bucket label used for metrics, empty for non-JWT methods.
+// jwtLifetimeBucketOf returns the bucket label used for the [AuthCounter] metric only (it has no
+// effect on trusted headers). Non-JWT methods have no lifetime bucket, so they get the explicit
+// "none" label value rather than an empty string, which would be easy to mistake for a missing label
+// on the metric dimension.
 func jwtLifetimeBucketOf(authMethod string, clientToken jwt.Token) string {
 	if authMethod != dauth.AuthMethodJWT || clientToken == nil {
 		return "none"
