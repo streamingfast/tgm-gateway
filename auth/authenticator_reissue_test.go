@@ -81,7 +81,7 @@ func TestAuthenticator_Authenticate_ReissueFailure(t *testing.T) {
 			name:     "403 with unparseable body rejects with generic reason",
 			setup:    respond(403, `<html>nope</html>`),
 			wantCode: codes.PermissionDenied,
-			wantMsg:  "JWT reissue denied",
+			wantMsg:  "JWT validation denied",
 		},
 		{
 			name:     "429 fails open",

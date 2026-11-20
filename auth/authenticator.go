@@ -317,7 +317,7 @@ func (e *reissueError) toGRPCError() error {
 
 	reason := e.Response.Message
 	if reason == "" {
-		reason = "JWT reissue denied"
+		reason = "JWT validation denied"
 	}
 
 	return status.Error(code, reason)
