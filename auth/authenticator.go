@@ -18,6 +18,7 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jwt"
 	"github.com/streamingfast/dauth"
+	"github.com/streamingfast/dhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -147,6 +148,14 @@ func (a *authenticator) Authenticate(ctx context.Context, path string, headers m
 
 			newToken, err := a.reissueJWT(ctx, tokenString)
 			if err != nil {
+				var reissueErr *reissueError
+				if errors.As(err, &reissueErr) && reissueErr.isDenied() {
+					// Info() here because there won't be any other trace from the handler function
+					a.logger.Info("JWT reissue denied by issuer, rejecting request", zap.Error(err), zap.String("ip_address", ipAddress))
+					return ctx, reissueErr.toGRPCError()
+				}
+
+				// Issuer unavailable (transport error, timeout, 5xx, 429) or bad reply: fail open
 				a.logger.Warn("failed to reissue JWT, continuing with existing token", zap.Error(err))
 			} else {
 				token = newToken
@@ -267,6 +276,53 @@ func (a *authenticator) issueJWTFromAPIKey(ctx context.Context, apiKey string) (
 	return a.ParseJWT(issueResponse.Token)
 }
 
+// reissueError is returned by [authenticator.reissueJWT] when the issuer answered with a non-200 status.
+// Transport errors and timeouts are not wrapped in it, they are plain errors.
+//
+// Only the `message` of the issuer's [dhttp.ErrorResponse] is ever surfaced: its `details` can contain
+// the API key and must never reach the client or the error string.
+type reissueError struct {
+	StatusCode int
+	Response   dhttp.ErrorResponse
+}
+
+func newReissueError(statusCode int, body []byte) *reissueError {
+	e := &reissueError{StatusCode: statusCode}
+	// Body that is not the expected JSON (proxy HTML page, ...) leaves the message empty
+	_ = json.Unmarshal(body, &e.Response)
+	return e
+}
+
+func (e *reissueError) Error() string {
+	if e.Response.Message == "" {
+		return fmt.Sprintf("reissue endpoint returned status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("reissue endpoint returned status %d: %s", e.StatusCode, e.Response.Message)
+}
+
+// isDenied reports whether the issuer deterministically denied the reissue (disabled/revoked key,
+// disabled organization, unknown key, expired or invalid JWT), in which case the request must be rejected.
+// Any 4xx is a denial except 429: the issuer rate-limiting the plugin says nothing about the token, so it
+// is treated as unavailability like 5xx and the request fails open.
+func (e *reissueError) isDenied() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 && e.StatusCode != http.StatusTooManyRequests
+}
+
+// toGRPCError maps the denial to a gRPC error carrying the issuer's human-readable reason.
+func (e *reissueError) toGRPCError() error {
+	code := codes.Unauthenticated
+	if e.StatusCode == http.StatusForbidden {
+		code = codes.PermissionDenied
+	}
+
+	reason := e.Response.Message
+	if reason == "" {
+		reason = "JWT validation denied"
+	}
+
+	return status.Error(code, reason)
+}
+
 func (a *authenticator) reissueJWT(ctx context.Context, tokenString string) (jwt.Token, error) {
 	// Prepare the request body with the JWT string
 	requestBody := map[string]string{
@@ -301,7 +357,7 @@ func (a *authenticator) reissueJWT(ctx context.Context, tokenString string) (jwt
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("reissue endpoint returned status %d: %s", resp.StatusCode, string(body))
+		return nil, newReissueError(resp.StatusCode, body)
 	}
 
 	// Parse the response to get the new JWT
